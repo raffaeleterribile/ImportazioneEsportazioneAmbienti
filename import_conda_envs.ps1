@@ -534,7 +534,7 @@ foreach ($file in $yamlFiles) {
         $yamlFileToUse = New-UnpinnedYamlFile -OriginalYamlPath $file.FullName -TempDir $tempDir
     }
     
-    # Analizza se l'ambiente richiede gestione speciale
+    # Analizza se l'ambiente richiede gestione speciale DD
     $requiresSpecialHandling, $reason = Test-RequiresSpecialHandling -YamlFilePath $file.FullName
     
     if ($requiresSpecialHandling) {
