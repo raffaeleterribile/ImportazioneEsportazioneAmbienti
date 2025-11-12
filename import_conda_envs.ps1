@@ -18,6 +18,9 @@
 .PARAMETER UpgradePackages
     Se specificato, rimuove i pin di versione dai file YAML per installare le versioni più recenti compatibili
 
+.PARAMETER GenerateReport
+    Se specificato, genera un file di report dettagliato al termine dell'operazione
+
 .EXAMPLE
     .\import_conda_envs.ps1
     Importa tutti gli ambienti con impostazioni predefinite
@@ -27,12 +30,16 @@
     Importa gli ambienti usando le versioni più recenti disponibili (ignora i pin di versione)
 
 .EXAMPLE
+    .\import_conda_envs.ps1 -GenerateReport
+    Importa gli ambienti e genera un file di report dettagliato
+
+.EXAMPLE
     .\import_conda_envs.ps1 -TimeoutSeconds 300
     Importa con timeout di 5 minuti per ambienti complessi
 
 .EXAMPLE
-    .\import_conda_envs.ps1 -ImportDir "my_envs" -TimeoutSeconds 1200
-    Importa da directory personalizzata con timeout di 20 minuti
+    .\import_conda_envs.ps1 -ImportDir "my_envs" -TimeoutSeconds 1200 -GenerateReport
+    Importa da directory personalizzata con timeout di 20 minuti e genera report
 
 .NOTES
     - Rileva automaticamente Anaconda/Miniconda installato nel sistema
@@ -45,7 +52,8 @@
 param(
     [string]$ImportDir = "conda_env_exports",
     [int]$TimeoutSeconds = 600,
-    [switch]$UpgradePackages
+    [switch]$UpgradePackages,
+    [switch]$GenerateReport
 )
 
 # Specifica la cartella contenente i file YAML
@@ -212,7 +220,7 @@ function New-UnpinnedYamlFile {
     }
 }
 
-# Funzione per eseguire comandi conda con timeout e gestione errori migliorata
+# Funzione per eseguire comandi conda con timeout e gestione errori robusta
 function Invoke-CondaWithTimeout {
     param(
         [string]$EnvName,
@@ -241,86 +249,178 @@ function Invoke-CondaWithTimeout {
             $cmdArgs += "env", "update", "-n", $EnvName, "-f", $YamlFile
         }
         else {
-            throw "Operazione non supportata: $Operation"
+            return $false, "Operazione non supportata: $Operation"
         }
         
         # Aggiungi opzioni speciali per ambienti problematici
-        $cmdArgs += "--solver=libmamba"
+        $cmdArgs += "--solver=libmamba", "--verbose"
         
-        Write-Output "Esecuzione comando (timeout: ${TimeoutSeconds}s): conda $($cmdArgs -join ' ')"
+        Write-Output "🔧 Esecuzione comando (timeout: ${TimeoutSeconds}s): conda $($cmdArgs -join ' ')"
         
-        # Crea un job per eseguire il comando con timeout e cattura dell'output
+        # Crea un job per eseguire il comando con gestione errori migliorata
         $job = Start-Job -ScriptBlock {
             param($PythonPath, $CmdArgs)
+            
+            # Imposta gestione errori non terminante
+            $ErrorActionPreference = "SilentlyContinue"
+            $WarningPreference = "SilentlyContinue"
+            
             try {
-                $ErrorActionPreference = "Continue"
+                # Esegui il comando conda
                 $output = & $PythonPath -m conda @CmdArgs 2>&1
-                return @{
-                    Success  = $LASTEXITCODE -eq 0
-                    ExitCode = $LASTEXITCODE
-                    Output   = $output
-                    Error    = if ($LASTEXITCODE -ne 0) { $output | Where-Object { $_ -match "error|failed|exception|impossible" } } else { $null }
+                $exitCode = $LASTEXITCODE
+                
+                # Analizza l'output per errori specifici
+                $outputText = $output | Out-String
+                $errorLines = $output | Where-Object { 
+                    $_ -match "error|failed|exception|impossible|conflict|cannot|invalid" -and 
+                    $_ -notmatch "warning|note|info" 
                 }
+                
+                # Identifica errori pip specifici
+                $pipErrors = $output | Where-Object { 
+                    $_ -match "Pip subprocess error|ERROR: Cannot install|ERROR: ResolutionImpossible|CondaEnvException: Pip failed" 
+                }
+                
+                # Cattura messaggi importanti (progressi, installazioni completate, etc.)
+                $importantLines = $output | Where-Object { 
+                    $_ -match "Collecting package metadata|Solving environment|Installing|Downloading|Executing transaction|done|Preparing transaction|Verifying transaction" -or
+                    $_ -match "environment.*created|environment.*updated|^\s*\+\s+\w+" -or
+                    $_ -match "^#.*->.*#" -or # Progress bars
+                    $_ -match "Elapsed time|Total time|Found conflicts"
+                }
+                
+                $result = @{
+                    Success        = ($exitCode -eq 0)
+                    ExitCode       = $exitCode
+                    Output         = $outputText
+                    ErrorLines     = $errorLines
+                    PipErrors      = $pipErrors
+                    ImportantLines = $importantLines
+                    HasOutput      = ($null -ne $output -and $output.Count -gt 0)
+                }
+                
+                return $result
             }
             catch {
                 return @{
-                    Success  = $false
-                    ExitCode = -1
-                    Output   = $null
-                    Error    = $_.Exception.Message
+                    Success        = $false
+                    ExitCode       = -1
+                    Output         = $null
+                    ErrorLines     = @("Eccezione PowerShell: $($_.Exception.Message)")
+                    PipErrors      = @()
+                    ImportantLines = @()
+                    HasOutput      = $false
+                    Exception      = $_.Exception.Message
                 }
             }
         } -ArgumentList $pythonPath, $cmdArgs
         
         # Attendi il completamento o timeout
-        $completed = Wait-Job $job -Timeout $TimeoutSeconds
+        $completed = $null
+        try {
+            $completed = Wait-Job $job -Timeout $TimeoutSeconds
+        }
+        catch {
+            # Gestisci errori nel Wait-Job
+            Write-Output "Errore durante Wait-Job: $_"
+            Stop-Job $job -ErrorAction SilentlyContinue
+            Remove-Job $job -ErrorAction SilentlyContinue
+            return $false, "Errore nell'attesa del job: $_"
+        }
         
         if ($completed) {
             $jobState = $job.State
-            $jobResult = Receive-Job $job
-            Remove-Job $job
+            $jobResult = $null
+            
+            try {
+                $jobResult = Receive-Job $job -ErrorAction SilentlyContinue
+            }
+            catch {
+                Write-Output "Errore durante Receive-Job: $_"
+                Remove-Job $job -ErrorAction SilentlyContinue
+                return $false, "Errore nella ricezione del risultato del job: $_"
+            }
+            finally {
+                Remove-Job $job -ErrorAction SilentlyContinue
+            }
             
             if ($jobState -eq "Completed" -and $jobResult -and $jobResult.Success) {
-                Write-Output "Comando completato con successo"
+                Write-Output "✅ Comando completato con successo"
+                
+                # Mostra messaggi importanti del processo conda
+                if ($jobResult.ImportantLines -and $jobResult.ImportantLines.Count -gt 0) {
+                    Write-Output "📋 Output conda significativo:"
+                    foreach ($line in $jobResult.ImportantLines | Select-Object -First 10) {
+                        if ($line.Trim()) {
+                            Write-Output "   $line"
+                        }
+                    }
+                    if ($jobResult.ImportantLines.Count -gt 10) {
+                        Write-Output "   ... (altri $($jobResult.ImportantLines.Count - 10) messaggi)"
+                    }
+                }
+                
                 return $true, $null
             }
             else {
+                # Analizza gli errori
                 $errorMessage = "Comando fallito"
+                
                 if ($jobResult) {
-                    if ($jobResult.Error) {
-                        # Cerca errori specifici di pip
-                        $pipErrors = $jobResult.Output | Where-Object { $_ -match "Pip subprocess error|ERROR: Cannot install|ERROR: ResolutionImpossible|CondaEnvException: Pip failed" }
-                        if ($pipErrors) {
-                            $errorMessage = "Errore pip durante installazione: " + ($pipErrors -join "; ")
-                        }
-                        else {
-                            $errorMessage = "Errore conda: " + ($jobResult.Error -join "; ")
-                        }
+                    if ($jobResult.PipErrors -and $jobResult.PipErrors.Count -gt 0) {
+                        $errorMessage = "Errore pip: " + ($jobResult.PipErrors -join "; ")
+                    }
+                    elseif ($jobResult.ErrorLines -and $jobResult.ErrorLines.Count -gt 0) {
+                        $errorMessage = "Errore conda: " + ($jobResult.ErrorLines -join "; ")
+                    }
+                    elseif ($jobResult.Exception) {
+                        $errorMessage = "Eccezione: " + $jobResult.Exception
                     }
                     elseif ($jobResult.ExitCode -ne 0) {
-                        $errorMessage = "Comando terminato con exit code: $($jobResult.ExitCode)"
+                        $errorMessage = "Exit code: $($jobResult.ExitCode)"
+                    }
+                    
+                    # Mostra output dettagliato per debugging
+                    if ($jobResult.HasOutput) {
+                        Write-Output "📋 Output conda completo per debugging:"
+                        if ($jobResult.ImportantLines -and $jobResult.ImportantLines.Count -gt 0) {
+                            Write-Output "   Messaggi importanti:"
+                            foreach ($line in $jobResult.ImportantLines | Select-Object -First 5) {
+                                if ($line.Trim()) {
+                                    Write-Output "   📌 $line"
+                                }
+                            }
+                        }
+                        
+                        if ($jobResult.Output) {
+                            $outputLines = $jobResult.Output -split "`n" | Where-Object { $_.Trim() } | Select-Object -Last 10
+                            if ($outputLines) {
+                                Write-Output "   Ultime righe output:"
+                                foreach ($line in $outputLines) {
+                                    Write-Output "   🔍 $line"
+                                }
+                            }
+                        }
                     }
                 }
                 elseif ($jobState -ne "Completed") {
-                    $errorMessage = "Job terminato con stato: $jobState"
+                    $errorMessage = "Job stato: $jobState"
                 }
                 
-                Write-Error $errorMessage
                 return $false, $errorMessage
             }
         }
         else {
             # Timeout raggiunto
             $timeoutMessage = "Timeout raggiunto (${TimeoutSeconds}s) per l'ambiente $EnvName"
-            Write-Warning $timeoutMessage
-            Stop-Job $job
-            Remove-Job $job
+            Stop-Job $job -ErrorAction SilentlyContinue
+            Remove-Job $job -ErrorAction SilentlyContinue
             return $false, $timeoutMessage
         }
     }
     catch {
-        $errorMessage = "Errore durante l'esecuzione del comando conda per ${EnvName}: $_"
-        Write-Error $errorMessage
+        $errorMessage = "Errore nella funzione Invoke-CondaWithTimeout per ${EnvName}: $_"
         return $false, $errorMessage
     }
 }
@@ -390,6 +490,7 @@ Write-Output "=== Importazione Ambienti Conda ==="
 Write-Output "Directory di importazione: $importDir"
 Write-Output "Timeout per ambienti complessi: ${TimeoutSeconds}s"
 Write-Output "Modalità upgrade pacchetti: $(if ($UpgradePackages) { 'ATTIVATA (usa versioni più recenti)' } else { 'DISATTIVATA (usa versioni esatte dal YAML)' })"
+Write-Output "Generazione report: $(if ($GenerateReport) { 'ATTIVATA (salva file report)' } else { 'DISATTIVATA (solo output console)' })"
 Write-Output "Analisi automatica della complessità degli ambienti attivata"
 Write-Output ""
 
@@ -452,12 +553,15 @@ foreach ($file in $yamlFiles) {
             # Usa la funzione con timeout per gli ambienti complessi
             if ($requiresSpecialHandling) {
                 Write-Output "Usando gestione speciale per ambiente complesso '$envName'"
-                $success, $errorDetail = Invoke-CondaWithTimeout -EnvName $envName -YamlFile $yamlFileToUse -Operation "update"
+                $condaResult = Invoke-CondaWithTimeout -EnvName $envName -YamlFile $yamlFileToUse -Operation "update"
+                $success = $condaResult[0]
+                $errorDetail = if ($condaResult.Count -gt 1) { $condaResult[1] } else { $null }
+                
                 if (-not $success) {
-                    Write-Error "Errore durante l'aggiornamento dell'ambiente complesso '$envName': $errorDetail"
+                    Write-Warning "Errore durante l'aggiornamento dell'ambiente complesso '$envName': $errorDetail"
                     
                     # Determina se è un timeout o un errore
-                    if ($errorDetail -match "Timeout") {
+                    if ($errorDetail -and $errorDetail -match "Timeout") {
                         $timeoutEnvironments += $envName
                         $environmentResults[$envName] = @{
                             Status    = "TIMEOUT"
@@ -468,12 +572,12 @@ foreach ($file in $yamlFiles) {
                     }
                     else {
                         $failedEnvironments += $envName
-                        $errorDetails[$envName] = $errorDetail
+                        $errorDetails[$envName] = if ($errorDetail) { $errorDetail } else { "Errore sconosciuto" }
                         $environmentResults[$envName] = @{
                             Status    = "FAILED"
                             Operation = "Update"
                             Type      = "Complex"
-                            Error     = $errorDetail
+                            Error     = if ($errorDetail) { $errorDetail } else { "Errore sconosciuto" }
                         }
                     }
                     continue
@@ -491,10 +595,41 @@ foreach ($file in $yamlFiles) {
             }
             else {
                 # Prima aggiorna l'ambiente usando conda dall'ambiente base
-                $updateResult = & $anacondaPython -m conda env update -n $envName -f $yamlFileToUse 2>&1
-                if ($LASTEXITCODE -ne 0) {
-                    throw "Errore conda: $updateResult"
+                Write-Output "🔧 Aggiornamento ambiente standard '$envName'..."
+                $updateResult = & $anacondaPython -m conda env update -n $envName -f $yamlFileToUse --verbose 2>&1
+                
+                # Mostra output significativo
+                $importantLines = $updateResult | Where-Object { 
+                    $_ -match "Collecting package metadata|Solving environment|Installing|Downloading|Executing transaction|done|Preparing transaction|Verifying transaction" -or
+                    $_ -match "environment.*updated|^\s*\+\s+\w+" -or
+                    $_ -match "^#.*->.*#" -or # Progress bars
+                    $_ -match "Elapsed time|Total time|Found conflicts"
                 }
+                
+                if ($importantLines) {
+                    Write-Output "📋 Output conda:"
+                    foreach ($line in $importantLines | Select-Object -First 8) {
+                        if ($line.Trim()) {
+                            Write-Output "   $line"
+                        }
+                    }
+                }
+                
+                if ($LASTEXITCODE -ne 0) {
+                    # Mostra errori dettagliati
+                    $errorLines = $updateResult | Where-Object { 
+                        $_ -match "error|failed|exception|impossible|conflict|cannot|invalid" -and 
+                        $_ -notmatch "warning|note|info" 
+                    }
+                    if ($errorLines) {
+                        Write-Output "❌ Errori rilevati:"
+                        foreach ($errorLine in $errorLines | Select-Object -First 5) {
+                            Write-Output "   🚫 $errorLine"
+                        }
+                    }
+                    throw "Errore conda (Exit Code: $LASTEXITCODE)"
+                }
+                
                 $successfulEnvironments++
                 $updatedEnvironments += $envName
                 $environmentResults[$envName] = @{
@@ -506,19 +641,42 @@ foreach ($file in $yamlFiles) {
             }
             
             # Aggiorna pip usando il percorso diretto dell'ambiente
-            Write-Output "Aggiornamento pip nell'ambiente '$envName'..."
+            Write-Output "🔧 Aggiornamento pip nell'ambiente '$envName'..."
             try {
                 $envPythonPath = Join-Path -Path $envPath -ChildPath "python.exe"
                 if (Test-Path $envPythonPath) {
-                    & $envPythonPath -m pip install --upgrade pip 2>$null
-                    Write-Output "Pip aggiornato con successo"
+                    $pipResult = & $envPythonPath -m pip install --upgrade pip --verbose 2>&1
+                    
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Output "✅ Pip aggiornato con successo"
+                        # Mostra solo se ci sono stati aggiornamenti
+                        $upgradeLines = $pipResult | Where-Object { 
+                            $_ -match "Successfully installed|Requirement already satisfied|Downloading|Installing collected packages" 
+                        }
+                        if ($upgradeLines) {
+                            foreach ($line in $upgradeLines | Select-Object -First 3) {
+                                if ($line.Trim()) {
+                                    Write-Output "   📦 $line"
+                                }
+                            }
+                        }
+                    }
+                    else {
+                        Write-Warning "⚠️ Errore durante l'aggiornamento pip (Exit Code: $LASTEXITCODE)"
+                        $pipErrors = $pipResult | Where-Object { $_ -match "error|failed|cannot" }
+                        if ($pipErrors) {
+                            foreach ($pipError in $pipErrors | Select-Object -First 3) {
+                                Write-Output "   🚫 $pipError"
+                            }
+                        }
+                    }
                 }
                 else {
-                    Write-Warning "Python non trovato nell'ambiente $envName, salto aggiornamento pip"
+                    Write-Warning "⚠️ Python non trovato nell'ambiente $envName, salto aggiornamento pip"
                 }
             }
             catch {
-                Write-Warning "Errore durante l'aggiornamento pip: $_"
+                Write-Warning "⚠️ Errore durante l'aggiornamento pip: $_"
             }
             
             Write-Output "Aggiornato l'ambiente $envName da $file"
@@ -541,12 +699,15 @@ foreach ($file in $yamlFiles) {
             # Usa la funzione con timeout per gli ambienti complessi
             if ($requiresSpecialHandling) {
                 Write-Output "Usando gestione speciale per ambiente complesso '$envName'"
-                $success, $errorDetail = Invoke-CondaWithTimeout -EnvName $envName -YamlFile $yamlFileToUse -Operation "create" -EnvPath $envPath
+                $condaResult = Invoke-CondaWithTimeout -EnvName $envName -YamlFile $yamlFileToUse -Operation "create" -EnvPath $envPath
+                $success = $condaResult[0]
+                $errorDetail = if ($condaResult.Count -gt 1) { $condaResult[1] } else { $null }
+                
                 if (-not $success) {
-                    Write-Error "Errore durante la creazione dell'ambiente complesso '$envName': $errorDetail"
+                    Write-Warning "Errore durante la creazione dell'ambiente complesso '$envName': $errorDetail"
                     
                     # Determina se è un timeout o un errore
-                    if ($errorDetail -match "Timeout") {
+                    if ($errorDetail -and $errorDetail -match "Timeout") {
                         $timeoutEnvironments += $envName
                         $environmentResults[$envName] = @{
                             Status    = "TIMEOUT"
@@ -557,12 +718,12 @@ foreach ($file in $yamlFiles) {
                     }
                     else {
                         $failedEnvironments += $envName
-                        $errorDetails[$envName] = $errorDetail
+                        $errorDetails[$envName] = if ($errorDetail) { $errorDetail } else { "Errore sconosciuto" }
                         $environmentResults[$envName] = @{
                             Status    = "FAILED"
                             Operation = "Create"
                             Type      = "Complex"
-                            Error     = $errorDetail
+                            Error     = if ($errorDetail) { $errorDetail } else { "Errore sconosciuto" }
                         }
                     }
                     continue
@@ -580,10 +741,41 @@ foreach ($file in $yamlFiles) {
             }
             else {
                 # Crea un nuovo ambiente
-                $createResult = & $anacondaPython -m conda env create -f $yamlFileToUse --prefix $envPath 2>&1
-                if ($LASTEXITCODE -ne 0) {
-                    throw "Errore conda: $createResult"
+                Write-Output "🔧 Creazione nuovo ambiente standard '$envName'..."
+                $createResult = & $anacondaPython -m conda env create -f $yamlFileToUse --prefix $envPath --verbose 2>&1
+                
+                # Mostra output significativo
+                $importantLines = $createResult | Where-Object { 
+                    $_ -match "Collecting package metadata|Solving environment|Installing|Downloading|Executing transaction|done|Preparing transaction|Verifying transaction" -or
+                    $_ -match "environment.*created|^\s*\+\s+\w+" -or
+                    $_ -match "^#.*->.*#" -or # Progress bars
+                    $_ -match "Elapsed time|Total time|Found conflicts"
                 }
+                
+                if ($importantLines) {
+                    Write-Output "📋 Output conda:"
+                    foreach ($line in $importantLines | Select-Object -First 8) {
+                        if ($line.Trim()) {
+                            Write-Output "   $line"
+                        }
+                    }
+                }
+                
+                if ($LASTEXITCODE -ne 0) {
+                    # Mostra errori dettagliati
+                    $errorLines = $createResult | Where-Object { 
+                        $_ -match "error|failed|exception|impossible|conflict|cannot|invalid" -and 
+                        $_ -notmatch "warning|note|info" 
+                    }
+                    if ($errorLines) {
+                        Write-Output "❌ Errori rilevati:"
+                        foreach ($errorLine in $errorLines | Select-Object -First 5) {
+                            Write-Output "   🚫 $errorLine"
+                        }
+                    }
+                    throw "Errore conda (Exit Code: $LASTEXITCODE)"
+                }
+                
                 $successfulEnvironments++
                 $createdEnvironments += $envName
                 $environmentResults[$envName] = @{
@@ -595,19 +787,42 @@ foreach ($file in $yamlFiles) {
             }
             
             # Aggiorna pip nel nuovo ambiente usando il percorso diretto
-            Write-Output "Configurazione finale dell'ambiente '$envName'..."
+            Write-Output "🔧 Configurazione finale dell'ambiente '$envName'..."
             try {
                 $envPythonPath = Join-Path -Path $envPath -ChildPath "python.exe"
                 if (Test-Path $envPythonPath) {
-                    & $envPythonPath -m pip install --upgrade pip 2>$null
-                    Write-Output "Pip aggiornato nel nuovo ambiente"
+                    $pipResult = & $envPythonPath -m pip install --upgrade pip --verbose 2>&1
+                    
+                    if ($LASTEXITCODE -eq 0) {
+                        Write-Output "✅ Pip aggiornato nel nuovo ambiente"
+                        # Mostra solo se ci sono stati aggiornamenti
+                        $upgradeLines = $pipResult | Where-Object { 
+                            $_ -match "Successfully installed|Requirement already satisfied|Downloading|Installing collected packages" 
+                        }
+                        if ($upgradeLines) {
+                            foreach ($line in $upgradeLines | Select-Object -First 3) {
+                                if ($line.Trim()) {
+                                    Write-Output "   📦 $line"
+                                }
+                            }
+                        }
+                    }
+                    else {
+                        Write-Warning "⚠️ Errore durante l'aggiornamento pip nel nuovo ambiente (Exit Code: $LASTEXITCODE)"
+                        $pipErrors = $pipResult | Where-Object { $_ -match "error|failed|cannot" }
+                        if ($pipErrors) {
+                            foreach ($pipError in $pipErrors | Select-Object -First 3) {
+                                Write-Output "   🚫 $pipError"
+                            }
+                        }
+                    }
                 }
                 else {
-                    Write-Warning "Python non trovato nel nuovo ambiente $envName"
+                    Write-Warning "⚠️ Python non trovato nel nuovo ambiente $envName"
                 }
             }
             catch {
-                Write-Warning "Errore durante l'aggiornamento pip nel nuovo ambiente: $_"
+                Write-Warning "⚠️ Errore durante l'aggiornamento pip nel nuovo ambiente: $_"
             }
             
             Write-Output "Creato l'ambiente $envName da $file"
@@ -789,9 +1004,22 @@ else {
     Write-Output "   🔍 Verifica gli ambienti con: conda env list"
 }
 
-# Salva rapporto dettagliato su file
-$reportPath = "import_report_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
-$report = @"
+# Salva rapporto dettagliato su file (solo se richiesto)
+if ($GenerateReport) {
+    $reportPath = "import_report_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+
+    # Costruisci la sezione dettagli con formattazione migliorata
+    $detailsSection = ""
+    foreach ($env in $environmentResults.Keys | Sort-Object) {
+        $result = $environmentResults[$env]
+        $detailsSection += "$env`: $($result.Status) - $($result.Operation) ($($result.Type))`n"
+        if ($result.Error) { 
+            $detailsSection += "  Errore: $($result.Error)`n"
+        }
+        $detailsSection += "`n"  # Aggiunge una riga vuota tra gli ambienti
+    }
+
+    $report = @"
 RAPPORTO IMPORTAZIONE AMBIENTI CONDA
 ====================================
 Data: $(Get-Date)
@@ -801,14 +1029,10 @@ Falliti: $($failedEnvironments.Count)
 Timeout: $($timeoutEnvironments.Count)
 
 DETTAGLI:
-$(
-foreach ($env in $environmentResults.Keys | Sort-Object) {
-    $result = $environmentResults[$env]
-    "$env`: $($result.Status) - $($result.Operation) ($($result.Type))"
-    if ($result.Error) { "  Errore: $($result.Error)" }
-}
-)
+
+$detailsSection
 "@
+}
 
 # Pulizia file temporanei se creati
 if ($tempDir -and (Test-Path $tempDir)) {
@@ -821,13 +1045,19 @@ if ($tempDir -and (Test-Path $tempDir)) {
     }
 }
 
-try {
-    $report | Out-File -FilePath $reportPath -Encoding UTF8
-    Write-Output ""
-    Write-Output "📄 Rapporto dettagliato salvato in: $reportPath"
+if ($GenerateReport) {
+    try {
+        $report | Out-File -FilePath $reportPath -Encoding UTF8
+        Write-Output ""
+        Write-Output "📄 Rapporto dettagliato salvato in: $reportPath"
+    }
+    catch {
+        Write-Warning "Impossibile salvare il rapporto: $_"
+    }
 }
-catch {
-    Write-Warning "Impossibile salvare il rapporto: $_"
+else {
+    Write-Output ""
+    Write-Output "📄 Rapporto non generato (usa -GenerateReport per crearlo)"
 }
 
 # Ripristina l'ambiente base di conda

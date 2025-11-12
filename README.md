@@ -22,6 +22,8 @@ Importa o aggiorna ambienti Conda da file YAML con gestione avanzata per ambient
 - Modalità upgrade pacchetti con rimozione pin di versione
 - Analisi automatica della complessità degli ambienti
 - Gestione timeout per ambienti problematici
+- **NUOVO**: Cattura e visualizzazione output conda/pip dettagliato
+- **NUOVO**: Generazione report opzionale con parametro `-GenerateReport`
 - Rilevamento e diagnosi errori pip/conda specifici
 - Report dettagliato con suggerimenti di risoluzione
 
@@ -39,6 +41,8 @@ Aggiorna tutti gli ambienti Conda esistenti nel sistema.
 1. **Blocchi durante la risoluzione delle dipendenze** - specialmente per ambienti complessi
 2. **Errori pip non rilevati** - conflitti di dipendenze non segnalati correttamente
 3. **Versioni obsolete** - impossibilità di usare versioni più recenti dei pacchetti
+4. **NUOVO: Debugging difficile** - output conda/pip nascosto rendeva difficile identificare problemi
+5. **NUOVO: File di report indesiderati** - generazione automatica di file non sempre necessari
 
 ## SOLUZIONI IMPLEMENTATE:
 
@@ -64,6 +68,12 @@ Aggiorna tutti gli ambienti Conda esistenti nel sistema.
 
 # Modalità upgrade (versioni più recenti)
 .\import_conda_envs.ps1 -UpgradePackages -TimeoutSeconds 600
+
+# NUOVO: Con generazione report dettagliato
+.\import_conda_envs.ps1 -GenerateReport
+
+# NUOVO: Combinazione parametri con report
+.\import_conda_envs.ps1 -UpgradePackages -GenerateReport -TimeoutSeconds 600
 ```
 
 ### 4. GESTIONE ERRORI MIGLIORATA
@@ -72,6 +82,12 @@ Aggiorna tutti gli ambienti Conda esistenti nel sistema.
 - **Errori conda**: Conflitti pacchetti conda
 - **Timeout**: Superamento tempo limite
 - **Exit codes**: Rilevamento automatico di comandi falliti
+
+**NUOVO: Output Dettagliato:**
+- **Cattura completa**: Tutti i comandi conda/pip ora mostrano output dettagliato con flag `--verbose`
+- **Messaggi significativi**: Visualizza automaticamente progressi, installazioni, download
+- **Debug migliorato**: Output completo in caso di errori per facilitare diagnosi
+- **Formattazione strutturata**: Output organizzato con emoji e indentazione per leggibilità
 
 **Suggerimenti mirati:**
 - Errori pip → Prova modalità `-UpgradePackages`
@@ -105,14 +121,50 @@ Aggiorna tutti gli ambienti Conda esistenti nel sistema.
 - Gestione errori dedicata
 - Monitoraggio con PowerShell Jobs
 
-### 7. RIEPILOGO DETTAGLIATO AVANZATO
+### 7. NUOVE FUNZIONALITÀ 2024 🆕
+
+#### 📋 OUTPUT DETTAGLIATO CONDA/PIP
+**Problema risolto**: Prima era difficile capire cosa stesse succedendo durante l'installazione
+**Soluzione**:
+- **Flag `--verbose`**: Tutti i comandi conda/pip ora mostrano output dettagliato
+- **Cattura intelligente**: Filtra e mostra solo i messaggi più importanti:
+  - "Collecting package metadata"
+  - "Solving environment" 
+  - "Downloading and Extracting Packages"
+  - "Installing collected packages"
+  - Progress bars e statistiche
+- **Formattazione strutturata**: Output organizzato con emoji (📋 🔧 ✅ ❌) per leggibilità
+- **Debug completo**: In caso di errori, mostra output completo per diagnosi
+
+#### 📄 GENERAZIONE REPORT OPZIONALE
+**Problema risolto**: Prima venivano sempre creati file di report, sporcando la directory
+**Soluzione**:
+- **Parametro `-GenerateReport`**: Crea file solo quando esplicitamente richiesto
+- **Comportamento predefinito**: Nessun file generato, solo output console
+- **Report migliorato**: Formattazione con righe vuote tra ambienti per leggibilità
+- **Controllo esplicito**: L'utente decide consapevolmente quando salvare
+
+**Esempi**:
+```powershell
+# Nessun file di report (comportamento predefinito)
+.\import_conda_envs.ps1
+
+# Genera file di report dettagliato
+.\import_conda_envs.ps1 -GenerateReport
+
+# Combinazione con altre opzioni
+.\import_conda_envs.ps1 -UpgradePackages -GenerateReport
+```
+
+### 8. RIEPILOGO DETTAGLIATO AVANZATO
 Al termine dell'esecuzione fornisce:
 - **Statistiche complete**: Totale processati, successi, fallimenti, timeout, tasso di successo
 - **Analisi per complessità**: Classificazione automatica standard vs complessi
 - **Operazioni dettagliate**: Distingue tra creati/aggiornati con tipo di ambiente
 - **Diagnosi errori specifica**: Identifica errori pip, conda, timeout con suggerimenti mirati
 - **Strategie di risoluzione**: Comandi specifici per risolvere problemi comuni
-- **Rapporto su file**: Salvataggio automatico del report dettagliato
+- **NUOVO: Rapporto opzionale**: Parametro `-GenerateReport` per salvare file dettagliato solo quando richiesto
+- **NUOVO: Formattazione migliorata**: Report con sezioni separate e righe vuote tra ambienti
 
 ### 8. RILEVAMENTO AUTOMATICO
 - **Rilevamento dinamico di Anaconda/Miniconda**:
@@ -139,11 +191,12 @@ Al termine dell'esecuzione fornisce:
 
 **`import_conda_envs.ps1`**:
 ```powershell
-.\import_conda_envs.ps1 [-ImportDir "directory"] [-TimeoutSeconds 600] [-UpgradePackages]
+.\import_conda_envs.ps1 [-ImportDir "directory"] [-TimeoutSeconds 600] [-UpgradePackages] [-GenerateReport]
 ```
 - **ImportDir**: Directory contenente i file YAML (default: "conda_env_exports")
 - **TimeoutSeconds**: Timeout per ambienti complessi (default: 600 secondi)
 - **UpgradePackages**: Usa versioni più recenti invece di quelle esatte dal YAML
+- **GenerateReport**: **NUOVO** - Genera file di report dettagliato (default: non genera file)
 
 **`update_conda_envs.ps1`**:
 ```powershell
@@ -163,6 +216,9 @@ Al termine dell'esecuzione fornisce:
 
 # 3. (Opzionale) Se hai errori di dipendenze, usa modalità upgrade
 .\import_conda_envs.ps1 -UpgradePackages
+
+# 4. (Opzionale) Genera report dettagliato per documentazione
+.\import_conda_envs.ps1 -GenerateReport
 ```
 
 ### 🆕 Scenario 2: Condivisione Ambienti tra Sistemi
@@ -170,8 +226,8 @@ Al termine dell'esecuzione fornisce:
 # Sistema A: Esporta ambienti
 .\export_conda_envs.ps1 -ExportDir "shared_envs"
 
-# Sistema B: Importa con versioni aggiornate
-.\import_conda_envs.ps1 -ImportDir "shared_envs" -UpgradePackages
+# Sistema B: Importa con versioni aggiornate e report
+.\import_conda_envs.ps1 -ImportDir "shared_envs" -UpgradePackages -GenerateReport
 ```
 
 ### 🔧 Scenario 3: Manutenzione Periodica
@@ -233,6 +289,12 @@ dependencies:
 # Combinazione modalità upgrade + timeout personalizzato
 .\import_conda_envs.ps1 -UpgradePackages -TimeoutSeconds 1200
 
+# NUOVO: Solo generare report senza modifiche
+.\import_conda_envs.ps1 -GenerateReport
+
+# NUOVO: Combinazione completa con tutti i parametri
+.\import_conda_envs.ps1 -ImportDir "my_environments" -UpgradePackages -GenerateReport -TimeoutSeconds 1800
+
 # Directory personalizzata
 .\import_conda_envs.ps1 -ImportDir "my_environments" -UpgradePackages
 
@@ -246,15 +308,32 @@ dependencies:
 Directory di importazione: conda_env_exports
 Timeout per ambienti complessi: 600s
 Modalità upgrade pacchetti: ATTIVATA (usa versioni più recenti)
+Generazione report: ATTIVATA (salva file report)
 Analisi automatica della complessità degli ambienti attivata
 🔧 Directory temporanea per YAML senza pin: C:\Users\...\Temp\conda_unpinned_20251112143022
 
 🔧 Preparazione file YAML senza pin di versione per 'data_science'...
    📝 File YAML senza pin creato: data_science_unpinned.yml
 Ambiente 'data_science': COMPLESSO - Versione Python specifica/legacy
+🔧 Creazione nuovo ambiente standard 'basic_env'...
+📋 Output conda:
+   Collecting package metadata (repodata.json): done
+   Solving environment: done
+   Downloading and Extracting Packages: 
+   numpy-1.24.3         | 6.9 MB    | ##################################### | 100%
+   Executing transaction: done
+✅ Pip aggiornato nel nuovo ambiente
+   📦 Successfully installed pip-23.2.1
+
 Creazione nuovo ambiente data_science da data_science_unpinned.yml
 Usando gestione speciale per ambiente complesso 'data_science'
-Errore durante la creazione dell'ambiente complesso 'data_science': Errore pip durante installazione: Pip subprocess error; ERROR: Cannot install tensorflow==2.8.0
+🔧 Esecuzione comando (timeout: 600s): conda env create -f data_science_unpinned.yml --solver=libmamba --verbose
+✅ Comando completato con successo
+📋 Output conda significativo:
+   Collecting package metadata (repodata.json): done
+   Solving environment: done
+   tensorflow-2.13.0   | 421.2 MB | ##################################### | 100%
+   Executing transaction: done
 
 ════════════════════════════════════════════════════════════════
                     RIEPILOGO DETTAGLIATO IMPORTAZIONE
@@ -292,6 +371,9 @@ Errore durante la creazione dell'ambiente complesso 'data_science': Errore pip d
 
 🧹 File YAML temporanei puliti
 📄 Rapporto dettagliato salvato in: import_report_20251112_143045.txt
+
+🔄 Ripristino ambiente base di conda...
+   ✅ Ambiente base ripristinato correttamente
 
 ════════════════════════════════════════════════════════════════
                        IMPORTAZIONE COMPLETATA!
