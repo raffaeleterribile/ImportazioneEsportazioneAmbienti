@@ -15,9 +15,16 @@
 .PARAMETER TimeoutSeconds
     Timeout in secondi per ambienti complessi rilevati automaticamente. Default: 600 (10 minuti)
 
+.PARAMETER UpgradePackages
+    Se specificato, rimuove i pin di versione dai file YAML per installare le versioni più recenti compatibili
+
 .EXAMPLE
     .\import_conda_envs.ps1
     Importa tutti gli ambienti con impostazioni predefinite
+
+.EXAMPLE
+    .\import_conda_envs.ps1 -UpgradePackages
+    Importa gli ambienti usando le versioni più recenti disponibili (ignora i pin di versione)
 
 .EXAMPLE
     .\import_conda_envs.ps1 -TimeoutSeconds 300
@@ -37,7 +44,8 @@
 
 param(
     [string]$ImportDir = "conda_env_exports",
-    [int]$TimeoutSeconds = 600
+    [int]$TimeoutSeconds = 600,
+    [switch]$UpgradePackages
 )
 
 # Specifica la cartella contenente i file YAML
@@ -170,7 +178,41 @@ function Test-CondaEnvironment {
     return $envList | Select-String -Pattern "^\s*$EnvName\s" -Quiet
 }
 
-# Funzione per eseguire comandi conda con timeout e opzioni speciali per ambienti problematici
+# Funzione per creare un file YAML temporaneo senza pin di versione
+function New-UnpinnedYamlFile {
+    param(
+        [string]$OriginalYamlPath,
+        [string]$TempDir
+    )
+    
+    try {
+        $content = Get-Content $OriginalYamlPath -Raw
+        $envName = [System.IO.Path]::GetFileNameWithoutExtension($OriginalYamlPath)
+        
+        # Rimuovi i pin di versione mantenendo la struttura
+        $unpinnedContent = $content -replace '(\s*-\s+)([^=\s]+)=[^\s]+(\s*)', '$1$2$3'
+        
+        # Rimuovi anche i pin di versione con build (es: numpy=1.21.0=py38_0)
+        $unpinnedContent = $unpinnedContent -replace '(\s*-\s+)([^=\s]+)=[^=\s]+=[\w\d]+(\s*)', '$1$2$3'
+        
+        # Per le dipendenze pip nella sezione pip:, rimuovi versioni specifiche
+        # Gestisce sia il formato '- package==version' che '- package>=version' etc.
+        $unpinnedContent = $unpinnedContent -replace '(\s*-\s+)([^=\s<>!#]+)[=<>!]+[^\s#]*(\s*)', '$1$2$3'
+        
+        # Crea il file temporaneo
+        $tempYamlPath = Join-Path $TempDir "${envName}_unpinned.yml"
+        $unpinnedContent | Out-File -FilePath $tempYamlPath -Encoding UTF8
+        
+        Write-Output "   📝 File YAML senza pin creato: $(Split-Path $tempYamlPath -Leaf)"
+        return $tempYamlPath
+    }
+    catch {
+        Write-Error "Errore nella creazione del file YAML senza pin per ${OriginalYamlPath}: $_"
+        return $OriginalYamlPath  # Fallback al file originale
+    }
+}
+
+# Funzione per eseguire comandi conda con timeout e gestione errori migliorata
 function Invoke-CondaWithTimeout {
     param(
         [string]$EnvName,
@@ -207,10 +249,27 @@ function Invoke-CondaWithTimeout {
         
         Write-Output "Esecuzione comando (timeout: ${TimeoutSeconds}s): conda $($cmdArgs -join ' ')"
         
-        # Crea un job per eseguire il comando con timeout
+        # Crea un job per eseguire il comando con timeout e cattura dell'output
         $job = Start-Job -ScriptBlock {
             param($PythonPath, $CmdArgs)
-            & $PythonPath -m conda @CmdArgs
+            try {
+                $ErrorActionPreference = "Continue"
+                $output = & $PythonPath -m conda @CmdArgs 2>&1
+                return @{
+                    Success  = $LASTEXITCODE -eq 0
+                    ExitCode = $LASTEXITCODE
+                    Output   = $output
+                    Error    = if ($LASTEXITCODE -ne 0) { $output | Where-Object { $_ -match "error|failed|exception|impossible" } } else { $null }
+                }
+            }
+            catch {
+                return @{
+                    Success  = $false
+                    ExitCode = -1
+                    Output   = $null
+                    Error    = $_.Exception.Message
+                }
+            }
         } -ArgumentList $pythonPath, $cmdArgs
         
         # Attendi il completamento o timeout
@@ -218,29 +277,51 @@ function Invoke-CondaWithTimeout {
         
         if ($completed) {
             $jobState = $job.State
-            Receive-Job $job | Out-Null  # Consuma l'output senza memorizzarlo
+            $jobResult = Receive-Job $job
             Remove-Job $job
             
-            if ($jobState -eq "Completed") {
+            if ($jobState -eq "Completed" -and $jobResult -and $jobResult.Success) {
                 Write-Output "Comando completato con successo"
-                return $true
+                return $true, $null
             }
             else {
-                Write-Error "Il job è terminato con stato: $jobState"
-                return $false
+                $errorMessage = "Comando fallito"
+                if ($jobResult) {
+                    if ($jobResult.Error) {
+                        # Cerca errori specifici di pip
+                        $pipErrors = $jobResult.Output | Where-Object { $_ -match "Pip subprocess error|ERROR: Cannot install|ERROR: ResolutionImpossible|CondaEnvException: Pip failed" }
+                        if ($pipErrors) {
+                            $errorMessage = "Errore pip durante installazione: " + ($pipErrors -join "; ")
+                        }
+                        else {
+                            $errorMessage = "Errore conda: " + ($jobResult.Error -join "; ")
+                        }
+                    }
+                    elseif ($jobResult.ExitCode -ne 0) {
+                        $errorMessage = "Comando terminato con exit code: $($jobResult.ExitCode)"
+                    }
+                }
+                elseif ($jobState -ne "Completed") {
+                    $errorMessage = "Job terminato con stato: $jobState"
+                }
+                
+                Write-Error $errorMessage
+                return $false, $errorMessage
             }
         }
         else {
             # Timeout raggiunto
-            Write-Warning "Timeout raggiunto (${TimeoutSeconds}s) per l'ambiente $EnvName"
+            $timeoutMessage = "Timeout raggiunto (${TimeoutSeconds}s) per l'ambiente $EnvName"
+            Write-Warning $timeoutMessage
             Stop-Job $job
             Remove-Job $job
-            return $false
+            return $false, $timeoutMessage
         }
     }
     catch {
-        Write-Error "Errore durante l'esecuzione del comando conda per $EnvName`: $_"
-        return $false
+        $errorMessage = "Errore durante l'esecuzione del comando conda per ${EnvName}: $_"
+        Write-Error $errorMessage
+        return $false, $errorMessage
     }
 }
 
@@ -283,6 +364,11 @@ function Test-RequiresSpecialHandling {
         
         # 5. Pip dependencies (spesso causano conflitti)
         if ($content -match '^\s*-\s+pip\s*:' -or $content -match '^\s*pip\s*:') {
+            # Conta quante dipendenze pip ci sono
+            $pipMatches = [regex]::Matches($content, '^\s*-\s+\w+==[\d\.]+', [System.Text.RegularExpressions.RegexOptions]::Multiline)
+            if ($pipMatches.Count -gt 5) {
+                return $true, "Molte dipendenze pip ($($pipMatches.Count))"
+            }
             return $true, "Contiene dipendenze pip"
         }
         
@@ -303,8 +389,18 @@ function Test-RequiresSpecialHandling {
 Write-Output "=== Importazione Ambienti Conda ==="
 Write-Output "Directory di importazione: $importDir"
 Write-Output "Timeout per ambienti complessi: ${TimeoutSeconds}s"
+Write-Output "Modalità upgrade pacchetti: $(if ($UpgradePackages) { 'ATTIVATA (usa versioni più recenti)' } else { 'DISATTIVATA (usa versioni esatte dal YAML)' })"
 Write-Output "Analisi automatica della complessità degli ambienti attivata"
 Write-Output ""
+
+# Crea directory temporanea per i file YAML modificati se necessario
+$tempDir = $null
+if ($UpgradePackages) {
+    $tempDir = Join-Path $env:TEMP "conda_unpinned_$(Get-Date -Format 'yyyyMMddHHmmss')"
+    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+    Write-Output "🔧 Directory temporanea per YAML senza pin: $tempDir"
+    Write-Output ""
+}
 
 # Contatori e tracciamento dettagliato per il riepilogo
 $totalEnvironments = 0
@@ -330,6 +426,13 @@ foreach ($file in $yamlFiles) {
     $envPath = Join-Path -Path $envsRootPath -ChildPath $envName
     $totalEnvironments++
     
+    # Determina quale file YAML usare
+    $yamlFileToUse = $file.FullName
+    if ($UpgradePackages) {
+        Write-Output "🔧 Preparazione file YAML senza pin di versione per '$envName'..."
+        $yamlFileToUse = New-UnpinnedYamlFile -OriginalYamlPath $file.FullName -TempDir $tempDir
+    }
+    
     # Analizza se l'ambiente richiede gestione speciale
     $requiresSpecialHandling, $reason = Test-RequiresSpecialHandling -YamlFilePath $file.FullName
     
@@ -349,15 +452,29 @@ foreach ($file in $yamlFiles) {
             # Usa la funzione con timeout per gli ambienti complessi
             if ($requiresSpecialHandling) {
                 Write-Output "Usando gestione speciale per ambiente complesso '$envName'"
-                $success = Invoke-CondaWithTimeout -EnvName $envName -YamlFile $file.FullName -Operation "update"
+                $success, $errorDetail = Invoke-CondaWithTimeout -EnvName $envName -YamlFile $yamlFileToUse -Operation "update"
                 if (-not $success) {
-                    Write-Error "Timeout o errore durante l'aggiornamento dell'ambiente complesso '$envName'"
-                    $timeoutEnvironments += $envName
-                    $environmentResults[$envName] = @{
-                        Status    = "TIMEOUT"
-                        Operation = "Update"
-                        Type      = "Complex"
-                        Error     = "Timeout durante aggiornamento ambiente complesso"
+                    Write-Error "Errore durante l'aggiornamento dell'ambiente complesso '$envName': $errorDetail"
+                    
+                    # Determina se è un timeout o un errore
+                    if ($errorDetail -match "Timeout") {
+                        $timeoutEnvironments += $envName
+                        $environmentResults[$envName] = @{
+                            Status    = "TIMEOUT"
+                            Operation = "Update"
+                            Type      = "Complex"
+                            Error     = $errorDetail
+                        }
+                    }
+                    else {
+                        $failedEnvironments += $envName
+                        $errorDetails[$envName] = $errorDetail
+                        $environmentResults[$envName] = @{
+                            Status    = "FAILED"
+                            Operation = "Update"
+                            Type      = "Complex"
+                            Error     = $errorDetail
+                        }
                     }
                     continue
                 }
@@ -374,7 +491,7 @@ foreach ($file in $yamlFiles) {
             }
             else {
                 # Prima aggiorna l'ambiente usando conda dall'ambiente base
-                $updateResult = & $anacondaPython -m conda env update -n $envName -f $file.FullName 2>&1
+                $updateResult = & $anacondaPython -m conda env update -n $envName -f $yamlFileToUse 2>&1
                 if ($LASTEXITCODE -ne 0) {
                     throw "Errore conda: $updateResult"
                 }
@@ -424,15 +541,29 @@ foreach ($file in $yamlFiles) {
             # Usa la funzione con timeout per gli ambienti complessi
             if ($requiresSpecialHandling) {
                 Write-Output "Usando gestione speciale per ambiente complesso '$envName'"
-                $success = Invoke-CondaWithTimeout -EnvName $envName -YamlFile $file.FullName -Operation "create" -EnvPath $envPath
+                $success, $errorDetail = Invoke-CondaWithTimeout -EnvName $envName -YamlFile $yamlFileToUse -Operation "create" -EnvPath $envPath
                 if (-not $success) {
-                    Write-Error "Timeout o errore durante la creazione dell'ambiente complesso '$envName'"
-                    $timeoutEnvironments += $envName
-                    $environmentResults[$envName] = @{
-                        Status    = "TIMEOUT"
-                        Operation = "Create"
-                        Type      = "Complex"
-                        Error     = "Timeout durante creazione ambiente complesso"
+                    Write-Error "Errore durante la creazione dell'ambiente complesso '$envName': $errorDetail"
+                    
+                    # Determina se è un timeout o un errore
+                    if ($errorDetail -match "Timeout") {
+                        $timeoutEnvironments += $envName
+                        $environmentResults[$envName] = @{
+                            Status    = "TIMEOUT"
+                            Operation = "Create"
+                            Type      = "Complex"
+                            Error     = $errorDetail
+                        }
+                    }
+                    else {
+                        $failedEnvironments += $envName
+                        $errorDetails[$envName] = $errorDetail
+                        $environmentResults[$envName] = @{
+                            Status    = "FAILED"
+                            Operation = "Create"
+                            Type      = "Complex"
+                            Error     = $errorDetail
+                        }
                     }
                     continue
                 }
@@ -449,7 +580,7 @@ foreach ($file in $yamlFiles) {
             }
             else {
                 # Crea un nuovo ambiente
-                $createResult = & $anacondaPython -m conda env create -f $file.FullName --prefix $envPath 2>&1
+                $createResult = & $anacondaPython -m conda env create -f $yamlFileToUse --prefix $envPath 2>&1
                 if ($LASTEXITCODE -ne 0) {
                     throw "Errore conda: $createResult"
                 }
@@ -545,26 +676,32 @@ if ($failedEnvironments.Count -gt 0) {
         Write-Output "   ❌ $env (Operazione: $($result.Operation), Tipo: $($result.Type))"
         
         # Analizza il tipo di errore per fornire suggerimenti specifici
-        $error = $result.Error
-        Write-Output "      💡 Errore: $error"
+        $errorMessage = $result.Error
+        Write-Output "      💡 Errore: $errorMessage"
         
         # Suggerimenti basati sul tipo di errore
-        if ($error -match "conflict|incompatible|version") {
-            Write-Output "      🔧 Suggerimento: Conflitto di versioni delle dipendenze"
+        if ($errorMessage -match "Errore pip|Pip subprocess error|Cannot install|ResolutionImpossible|Pip failed") {
+            Write-Output "      🔧 Suggerimento: Conflitto nelle dipendenze pip"
+            Write-Output "         • Le dipendenze pip nel file YAML sono incompatibili"
+            Write-Output "         • Prova: .\import_conda_envs.ps1 -UpgradePackages (usa versioni più recenti)"
+            Write-Output "         • Oppure modifica manualmente il file YAML rimuovendo le dipendenze pip problematiche"
+        }
+        elseif ($errorMessage -match "conflict|incompatible|version") {
+            Write-Output "      🔧 Suggerimento: Conflitto di versioni delle dipendenze conda"
             Write-Output "         • Controlla il file YAML per versioni incompatibili"
             Write-Output "         • Prova: conda env create -f $env.yml --force-reinstall"
         }
-        elseif ($error -match "channel|repository") {
+        elseif ($errorMessage -match "channel|repository") {
             Write-Output "      🔧 Suggerimento: Problemi con i canali conda"
             Write-Output "         • Verifica la connessione internet"
             Write-Output "         • Prova: conda clean --all && conda update conda"
         }
-        elseif ($error -match "package.*not found|404") {
+        elseif ($errorMessage -match "package.*not found|404") {
             Write-Output "      🔧 Suggerimento: Pacchetti non trovati"
             Write-Output "         • Alcuni pacchetti potrebbero essere obsoleti"
             Write-Output "         • Modifica il file YAML rimuovendo versioni specifiche"
         }
-        elseif ($error -match "permission|access|denied") {
+        elseif ($errorMessage -match "permission|access|denied") {
             Write-Output "      🔧 Suggerimento: Problemi di permessi"
             Write-Output "         • Esegui PowerShell come Amministratore"
             Write-Output "         • Controlla i permessi della cartella .conda"
@@ -672,6 +809,17 @@ foreach ($env in $environmentResults.Keys | Sort-Object) {
 }
 )
 "@
+
+# Pulizia file temporanei se creati
+if ($tempDir -and (Test-Path $tempDir)) {
+    try {
+        Remove-Item -Path $tempDir -Recurse -Force
+        Write-Output "🧹 File YAML temporanei puliti"
+    }
+    catch {
+        Write-Warning "Impossibile rimuovere i file temporanei da ${tempDir}: $_"
+    }
+}
 
 try {
     $report | Out-File -FilePath $reportPath -Encoding UTF8
